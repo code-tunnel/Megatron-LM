@@ -1,0 +1,15 @@
+# The rationale for this Definition file is for enabling torch compilation
+# https://github.com/huggingface/text-generation-inference/issues/1330#issuecomment-1861793002
+
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch:24.10-py3
+
+%post
+    echo $CUDA_HOME/compat/lib.real > /etc/ld.so.conf.d/libcuda.conf
+    ldconfig
+
+%runscript
+    exec "$@"
+
+%environment
+    export LC_ALL=C

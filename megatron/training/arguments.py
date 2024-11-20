@@ -76,8 +76,10 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
 
 
     # Args from environment
-    args.rank = int(os.getenv('RANK', '0'))
-    args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+    # adapt for openmpi
+    args.rank = int(os.getenv('RANK', os.getenv('OMPI_COMM_WORLD_RANK', '0')))
+    args.local_rank = int(os.getenv('LOCAL_RANK', os.getenv('OMPI_COMM_WORLD_LOCAL_RANK', '0')))
+    args.world_size = int(os.getenv("WORLD_SIZE", os.getenv('OMPI_COMM_WORLD_SIZE', '1')))
 
     return args
 

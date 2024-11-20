@@ -429,6 +429,8 @@ def _warmup_jit_function():
             output = bias_dropout_add_fused_train([input, bias], residual, dropout_rate)
     del bias, input, residual, output
     torch.cuda.empty_cache()
+    # (zhgeng) jit warmup may maximize the peak memory
+    torch.cuda.reset_peak_memory_stats()
 
 
 def setup_logging() -> None:

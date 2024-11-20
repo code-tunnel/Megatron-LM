@@ -9,3 +9,6 @@ logs
 .vscode
 local/
 .gitmodules
+
+*.log
+*.hostfile
