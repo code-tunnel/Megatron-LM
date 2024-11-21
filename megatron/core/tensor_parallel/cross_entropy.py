@@ -20,8 +20,10 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         torch.distributed.all_reduce(
             logits_max, op=torch.distributed.ReduceOp.MAX, group=get_tensor_model_parallel_group()
         )
+        # zhgeng: mem optimization
         # Subtract the maximum value.
-        vocab_parallel_logits = vocab_parallel_logits - logits_max.unsqueeze(dim=-1)
+        # vocab_parallel_logits = vocab_parallel_logits - logits_max.unsqueeze(dim=-1)
+        vocab_parallel_logits.sub_(logits_max.unsqueeze(dim=-1))
 
         # Get the partition's vocab indecies
         get_vocab_range = VocabUtility.vocab_range_from_per_partition_vocab_size

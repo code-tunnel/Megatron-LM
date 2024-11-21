@@ -18,6 +18,7 @@ from megatron.core import mpu, tensor_parallel
 from megatron.arguments import parse_args, validate_args
 from megatron.checkpointing import load_args_from_checkpoint
 from megatron.global_vars import set_global_variables
+from megatron.core.pipeline_parallel import set_pipeline_context
 from megatron.model.transformer import bias_dropout_add_fused_train
 from megatron.model.fused_bias_gelu import bias_gelu
 
@@ -63,8 +64,11 @@ def initialize_megatron(
         if args.rank == 0:
             print("> setting random seeds to {} ...".format(args.seed))
         _set_random_seed(args.seed, args.data_parallel_random_init)
+        
+        set_pipeline_context(args)
 
     args = get_args()
+    _set_raw_flops(args)
     if args.lazy_mpu_init:
         # TODO is this still a necessary option?
         args.use_cpu_initialization = True
@@ -87,6 +91,27 @@ def initialize_megatron(
 
         # No continuation function
         return None
+
+
+def _set_raw_flops(args):
+    L = args.num_layers
+    s = args.seq_length
+    h = args.hidden_size
+    V = args.padded_vocab_size
+
+    model_flops = 72*L*s*h*h*(1+s/(6*h)+V/(12*h*L))
+
+    if args.checkpoint_without_attn:
+        raw_flops = 96*L*s*h*h*(1+s/(8*h)+V/(16*h*L))
+    elif args.recompute_granularity == 'selective' and not args.use_flash_attn:
+        raw_flops = 72*L*s*h*h*(1+2*s/(9*h)+V/(12*h*L))
+    elif args.recompute_granularity == 'full':
+        raw_flops = 96*L*s*h*h*(1+s/(6*h)+V/(16*h*L))
+    else:
+        raw_flops = model_flops
+
+    args.model_flops = model_flops    
+    args.raw_flops = raw_flops
 
 
 def _compile_dependencies():
@@ -293,28 +318,30 @@ def _warmup_jit_function():
     else:
         dtype = torch.float32
 
-    # Warmup fused bias+gelu
-    bias = torch.rand(
-        args.ffn_hidden_size // args.tensor_model_parallel_size,
-        dtype=dtype,
-        device="cuda",
-    )
-    input = torch.rand(
-        (
-            args.seq_length,
-            args.micro_batch_size,
-            args.ffn_hidden_size // args.tensor_model_parallel_size,
-        ),
-        dtype=dtype,
-        device="cuda",
-    )
-    # Warmup JIT fusions with the input grad_enable state of both forward
-    # prop and recomputation
-    for bias_grad, input_grad in zip([True, True], [False, True]):
-        bias.requires_grad, input.requires_grad = bias_grad, input_grad
-        for _ in range(5):
-            output = bias_gelu(bias, input)
-    del bias, input, output
+    # zhgeng: mem optimization
+    # This is fused by triton
+    # # Warmup fused bias+gelu
+    # bias = torch.rand(
+    #     args.ffn_hidden_size // args.tensor_model_parallel_size,
+    #     dtype=dtype,
+    #     device="cuda",
+    # )
+    # input = torch.rand(
+    #     (
+    #         args.seq_length,
+    #         args.micro_batch_size,
+    #         args.ffn_hidden_size // args.tensor_model_parallel_size,
+    #     ),
+    #     dtype=dtype,
+    #     device="cuda",
+    # )
+    # # Warmup JIT fusions with the input grad_enable state of both forward
+    # # prop and recomputation
+    # for bias_grad, input_grad in zip([True, True], [False, True]):
+    #     bias.requires_grad, input.requires_grad = bias_grad, input_grad
+    #     for _ in range(5):
+    #         output = bias_gelu(bias, input)
+    # del bias, input, output
 
     # Warmup fused bias+dropout+add
     if args.sequence_parallel:
@@ -347,3 +374,6 @@ def _warmup_jit_function():
             output = bias_dropout_add_fused_train(input, bias, residual, dropout_rate)
     del bias, input, residual, output
     torch.cuda.empty_cache()
+    # zhgeng: mem optimization
+    # jit warmup may maximize the peak memory
+    torch.cuda.reset_peak_memory_stats()

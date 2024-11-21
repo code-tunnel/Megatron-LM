@@ -7,7 +7,7 @@ from torch.autograd import Variable
 from torch.nn.parameter import Parameter
 
 from megatron import get_args
-from megatron.core import mpu, tensor_parallel
+from megatron.core import parallel_state as mpu, tensor_parallel
 
 
 _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
@@ -156,7 +156,7 @@ class Float16Module(MegatronModule):
 
     def __init__(self, module, args):
         super(Float16Module, self).__init__()
-
+        self.args = args
         if args.fp16:
             self.add_module('module', module.half())
             def float16_convertor(val):
@@ -176,10 +176,17 @@ class Float16Module(MegatronModule):
 
 
     def forward(self, *inputs, **kwargs):
-        if mpu.is_pipeline_first_stage():
+        exit_cond = False
+        if self.args.attention_pipeline:
+            entry_cond = mpu.get_virtual_pipeline_model_parallel_rank() == 0 and mpu.get_pipeline_model_parallel_rank() == 0
+            # exit_cond = mpu.get_virtual_pipeline_model_parallel_rank() == mpu.get_virtual_pipeline_model_parallel_world_size()
+        else:
+            entry_cond = mpu.is_pipeline_first_stage()
+            exit_cond = mpu.is_pipeline_last_stage()
+        if entry_cond:
             inputs = fp32_to_float16(inputs, self.float16_convertor)
         outputs = self.module(*inputs, **kwargs)
-        if mpu.is_pipeline_last_stage():
+        if exit_cond:
             outputs = float16_to_fp32(outputs)
         return outputs
 

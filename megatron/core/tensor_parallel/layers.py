@@ -264,7 +264,8 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         output = torch.matmul(total_input, weight.t())
         if bias is not None:
-            output = output + bias
+            output.add_(bias)
+            # output = output + bias
         return output
 
     @staticmethod

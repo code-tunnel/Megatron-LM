@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from typing import Optional
+from itertools import accumulate
 
 from megatron import get_timers, get_args, get_retro_args, core, get_num_microbatches
 from .module import MegatronModule
@@ -16,8 +17,12 @@ from megatron.model import LayerNorm
 from megatron.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
+from megatron.model.triton_bias_gelu import fused_bias_gelu_triton
 from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
+from megatron.model.flatten_transformer_layer import FlattenTransformerLayer
+from megatron import get_num_microbatches
+from megatron.core.pipeline_parallel.activation_queue import set_activation_queue
 
 try:
     from einops import rearrange
@@ -101,6 +106,7 @@ class ParallelMLP(MegatronModule):
         self.bias_gelu_fusion = False
         self.activation_func = None
         self.swiglu = args.swiglu
+        self.use_triton_fusion = args.use_triton_fusion
 
         if args.openai_gelu:
             self.activation_func = openai_gelu
@@ -137,7 +143,10 @@ class ParallelMLP(MegatronModule):
         if self.bias_gelu_fusion:
             assert self.add_bias is True
             assert self.activation_func == F.gelu
-            intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+            if self.use_triton_fusion:
+                intermediate_parallel = fused_bias_gelu_triton(intermediate_parallel, bias_parallel)
+            else:
+                intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
         else:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
@@ -1214,6 +1223,34 @@ class NoopTransformerLayer(MegatronModule):
         return hidden_states.clone()
 
 
+def _print_estimated_statistics(num_layers, seq_length, micro_batch_size, hidden_size, vocab_size, 
+                                pipeline_parallel_size, pipeline_parallel_rank, tensor_parallel_size):
+    # count num parameters
+    # general
+    activation = (16*seq_length*micro_batch_size*hidden_size/tensor_parallel_size) * num_layers
+    model_states = hidden_size//tensor_parallel_size*(12*hidden_size+7+6*tensor_parallel_size) * num_layers
+
+    # specific to no activation checkpoint 
+    activation *= (pipeline_parallel_size - pipeline_parallel_rank)
+
+    # input & output processing
+    input_layer, output_layer = 0, 0
+    if mpu.is_pipeline_first_stage(True):
+        input_layer = vocab_size*hidden_size//tensor_parallel_size + seq_length*hidden_size
+    
+    if mpu.is_pipeline_last_stage(True):
+        output_layer = vocab_size*hidden_size//tensor_parallel_size + 2*hidden_size
+        # here uses 2 for vocab part, because we compute cross entropy in fp32
+        activation += 2*seq_length*micro_batch_size*(hidden_size+vocab_size)/tensor_parallel_size
+    
+    total_params = model_states + input_layer + output_layer
+    estimated_memory_overhead = (activation + model_states*6 + input_layer + output_layer)*2 / 1024**2
+    if mpu.get_data_parallel_rank() == 0:
+        print(f">>> pp, tp rank: {pipeline_parallel_rank, mpu.get_tensor_model_parallel_rank()}, "
+              f"num layers : {num_layers}, num_parameters this rank: {total_params:,d}, "
+                f"estimated memory usage: {estimated_memory_overhead:,.2f} MB")
+
+
 def _get_num_layers(args, model_type, is_decoder=False):
     """Compute the number of transformer layers resident on the current rank."""
     is_encoder_and_decoder_model = (model_type == ModelType.encoder_and_decoder)
@@ -1266,6 +1303,11 @@ def _get_num_layers(args, model_type, is_decoder=False):
             num_layers = args.encoder_num_layers
         else:
             num_layers = args.decoder_num_layers
+
+    _print_estimated_statistics(
+        num_layers, args.seq_length, args.micro_batch_size, args.hidden_size, args.padded_vocab_size, 
+        args.pipeline_model_parallel_size, mpu.get_pipeline_model_parallel_rank(), args.tensor_model_parallel_size)
+
     return num_layers
 
 
@@ -1368,7 +1410,15 @@ class ParallelTransformer(MegatronModule):
         # Number of layers.
         self.num_layers = _get_num_layers(args, model_type,
                                           layer_type==LayerType.decoder)
-
+        offset = None
+                
+        if args.checkpoint_without_attn and args.offload_activation:
+            pp_rank = mpu.get_pipeline_model_parallel_rank()
+            pp_size = mpu.get_pipeline_model_parallel_world_size()
+            num_microbatches = get_num_microbatches()
+            set_activation_queue(
+                pp_size, pp_rank, num_microbatches, self.num_layers)
+            
         self.drop_path_rates = [
             rate.item() for rate in
             torch.linspace(0, self.drop_path_rate, config.num_layers)]
@@ -1392,7 +1442,11 @@ class ParallelTransformer(MegatronModule):
                 current_layer_type = _get_layer_type(
                     model_type, layer_type, self.retro_layer_numbers,
                     layer_number)
-                return ParallelTransformerLayer(
+                if args.checkpoint_without_attn:
+                    layer_module = FlattenTransformerLayer
+                else:
+                    layer_module = ParallelTransformerLayer
+                return layer_module(
                     config,
                     layer_number,
                     layer_type=current_layer_type,
@@ -1455,7 +1509,7 @@ class ParallelTransformer(MegatronModule):
             offset = mpu.get_virtual_pipeline_model_parallel_rank() * (
                 config.num_layers // config.virtual_pipeline_model_parallel_size) + \
                 (mpu.get_pipeline_model_parallel_rank() * self.num_layers)
-        else:
+        elif offset is None:
             # Each stage gets a contiguous set of layers.
             if args.model_type == ModelType.encoder_and_decoder and \
                     mpu.get_pipeline_model_parallel_world_size() > 1:

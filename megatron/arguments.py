@@ -38,6 +38,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_inference_args(parser)
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
+    parser = _add_experimental_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -50,10 +51,42 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         args = parser.parse_args()
 
     # Args from environment
-    args.rank = int(os.getenv('RANK', '0'))
-    args.world_size = int(os.getenv("WORLD_SIZE", '1'))
-
+    args.rank = int(os.getenv('RANK', os.getenv('OMPI_COMM_WORLD_RANK', '0')))
+    args.world_size = int(os.getenv("WORLD_SIZE", os.getenv('OMPI_COMM_WORLD_SIZE', '1')))
+    # if args.local_rank is None and 'MPI_LOCALRANKID' in os.environ:
+    #     args.local_rank = int(os.environ["MPI_LOCALRANKID"])
+    
     return args
+
+
+def _add_experimental_args(parser: argparse.ArgumentParser):
+    group = parser.add_argument_group(title="experiment")
+
+    # General optimization
+    group.add_argument('--synthesize-dataloader', action='store_true')
+    group.add_argument('--no-attention-mask', action='store_true')
+    # seems that torch.script doesn't work for this fusion
+    group.add_argument('--no-use-triton-fusion', action='store_false', dest='use_triton_fusion')
+
+    # Simple memory optimization for 1F1B & megatron.model.flatten_transformer_layer
+    group.add_argument('--checkpoint-without-attn', action='store_true')
+    group.add_argument('--offload-activation', action='store_true')
+    group.add_argument('--parallel-position-embedding', action='store_true')
+
+    # Attention pipeline
+    # try to reuse `--num-layers-per-virtual-pipeline-stage``
+    group.add_argument('--attention-pipeline', action='store_true')
+    group.add_argument('--num-fold', type=int, default=1)
+    group.add_argument('--transfer-weight', action='store_true')
+    group.add_argument('--chunk-size', type=int, default=-1)
+    
+    # Profile setup
+    group.add_argument('--profile-prefix', type=str, default='tb_log')
+    group.add_argument('--dump-memory-snapshot', action='store_true')
+    group.add_argument('--memory-snapshot-prefix', type=str, default='mem_snapshot')
+    
+    return parser
+
 
 def validate_args(args, defaults={}):
     # Tensor model parallel size.
@@ -139,9 +172,13 @@ def validate_args(args, defaults={}):
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
     if args.num_layers_per_virtual_pipeline_stage is not None:
-        assert args.pipeline_model_parallel_size > 2, \
-            'pipeline-model-parallel size should be greater than 2 with ' \
-            'interleaved schedule'
+        if args.attention_pipeline:
+            assert args.num_layers % args.pipeline_model_parallel_size == 0
+            assert args.num_layers_per_virtual_pipeline_stage == 1
+        else:
+            assert args.pipeline_model_parallel_size > 2, \
+                'pipeline-model-parallel size should be greater than 2 with ' \
+                'interleaved schedule'
         assert args.num_layers % args.num_layers_per_virtual_pipeline_stage == 0, \
             'number of layers is not divisible by number of layers per virtual ' \
             'pipeline stage'

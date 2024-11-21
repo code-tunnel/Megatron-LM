@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron import get_args
-from megatron.core import mpu, tensor_parallel
+from megatron.core import parallel_state as mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.common.rotary_pos_embedding import RotaryEmbedding
 
@@ -151,6 +151,9 @@ class Embedding(MegatronModule):
 
         args = get_args()
 
+        self.parallel_position_embedding = args.parallel_position_embedding
+        self.embedding_dropout_prob = embedding_dropout_prob
+        
         # Word embeddings (parallel).
         self.embedding_weights_in_fp32 = embedding_weights_in_fp32
         self.params_dtype = args.params_dtype
@@ -161,12 +164,17 @@ class Embedding(MegatronModule):
         # Position embedding (serial).
         self.add_position_embedding = args.position_embedding_type == 'learned_absolute'
         if self.add_position_embedding:
-            self.position_embeddings = torch.nn.Embedding(
-                max_sequence_length, self.hidden_size)
+            if self.parallel_position_embedding:
+                self.position_embeddings = tensor_parallel.VocabParallelEmbedding(
+                    max_sequence_length, self.hidden_size, 
+                    config=config, init_method=config.init_method)
+            else:
+                self.position_embeddings = torch.nn.Embedding(
+                    max_sequence_length, self.hidden_size)
+                # Initialize the position embeddings.
+                if args.perform_initialization:
+                    self.init_method(self.position_embeddings.weight)
             self._position_embeddings_key = 'position_embeddings'
-            # Initialize the position embeddings.
-            if args.perform_initialization:
-                self.init_method(self.position_embeddings.weight)
 
         # Token type embedding.
         # Add this as an optional field that can be added through
@@ -174,6 +182,7 @@ class Embedding(MegatronModule):
         # token types and add them as needed.
         self._tokentype_embeddings_key = 'tokentype_embeddings'
         if self.num_tokentypes > 0:
+            assert False, "this branch does not support token type id"
             self.tokentype_embeddings = torch.nn.Embedding(self.num_tokentypes,
                                                            self.hidden_size)
             # Initialize the token-type embeddings.
@@ -249,6 +258,36 @@ class Embedding(MegatronModule):
                 embeddings = self.embedding_dropout(embeddings)
         else:
             embeddings = self.embedding_dropout(embeddings)
+
+        return embeddings
+
+    def parallel_pos_forward(self, input_ids, position_ids, tokentype_ids=None):
+        from .triton_embedding_add_dropout import embedding_add_dropout
+
+        # Embeddings.
+        if self.embedding_weights_in_fp32:
+            self.word_embeddings = self.word_embeddings.to(torch.float32)
+        # b, s, h
+        words_embeddings = self.word_embeddings(input_ids)
+        if self.embedding_weights_in_fp32:
+            words_embeddings = words_embeddings.to(self.params_dtype)
+            self.word_embeddings = self.word_embeddings.to(self.params_dtype)
+        
+        # s, b, h
+        embeddings = words_embeddings.transpose(0, 1).contiguous()
+        
+        # s, b, h
+        position_embeddings = None
+        if self.add_position_embedding:
+            position_embeddings = self.position_embeddings(position_ids)
+
+        embeddings = embedding_add_dropout(embeddings, position_embeddings, self.embedding_dropout_prob)
+        
+        if self.fp32_residual_connection:
+            embeddings = embeddings.float()
+        
+        if self.sequence_parallel:
+            embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
 
         return embeddings
 

@@ -1,1 +1,3 @@
 from .schedules import get_forward_backward_func
+from .activation_queue import get_activation_queue, set_activation_queue
+from .pipeline_context import set_pipeline_context, get_pipeline_context

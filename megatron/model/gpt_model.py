@@ -33,7 +33,10 @@ def post_language_model_processing(lm_output, labels, logit_weights,
             assert output.dtype == torch.half
             loss = tensor_parallel.vocab_parallel_cross_entropy(output, labels)
         else:
-            loss = tensor_parallel.vocab_parallel_cross_entropy(output.float(), labels)
+            # zhgeng: mem optimization
+            # loss = tensor_parallel.vocab_parallel_cross_entropy(output.float(), labels)
+            with torch.autocast("cuda", dtype=torch.float32):
+                loss = tensor_parallel.vocab_parallel_cross_entropy(output, labels)
         
         # [s b] => [b, s]
         loss = loss.transpose(0,1).contiguous()

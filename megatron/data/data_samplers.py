@@ -184,3 +184,21 @@ class MegatronPretrainingRandomSampler:
                 self.consumed_samples += self.micro_batch_times_data_parallel_size
                 yield batch
                 batch = []
+
+
+def build_synthesized_dataloader(args):
+    micro_batch_size = args.micro_batch_size
+    seq_len = args.seq_length
+    vocab_size = args.padded_vocab_size
+    def batch_generator():
+        tensor = torch.empty([micro_batch_size, seq_len+1], dtype=torch.long)
+        while True:
+            # with get_cuda_rng_tracker().fork():
+            torch.randint(
+                low=0, high=vocab_size, out=tensor,
+                size=[micro_batch_size, seq_len+1], dtype=torch.long)
+            yield {
+                'text': tensor
+            }
+
+    return batch_generator()

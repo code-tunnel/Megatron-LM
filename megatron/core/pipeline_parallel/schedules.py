@@ -116,7 +116,7 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     out.data = torch.empty((1,), device=out.device, dtype=out.dtype,)
 
 
-def custom_backward(output, grad_output):
+def custom_backward(output, grad_output, retain_graph=False):
     '''Directly call C++ autograd engine.
 
     To make the 'deallocate_output_tensor' (above) optimization work, the C++
@@ -140,7 +140,7 @@ def custom_backward(output, grad_output):
     Variable._execution_engine.run_backward(
         tensors=(output,),
         grad_tensors=(grad_output,),
-        keep_graph=False,
+        keep_graph=retain_graph,
         create_graph=False,
         inputs=tuple(),
         allow_unreachable=True,
