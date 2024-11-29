@@ -13,6 +13,7 @@ from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
 from megatron.arguments import core_transformer_config_from_args
 from megatron.core import tensor_parallel, parallel_state as mpu
+from megatron.core.tensor_parallel.mappings import _reduce_scatter_along_first_dim
 from megatron.core.tensor_parallel.random import get_cuda_rng_tracker,\
     _set_cuda_rng_state
 from megatron.core.pipeline_parallel import get_pipeline_context
@@ -20,10 +21,12 @@ from megatron.model import LayerNorm
 from megatron.model.module import MegatronModule
 from megatron.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.model.fused_bias_gelu import bias_gelu_impl
-from megatron.model.triton_bias_gelu import fused_bias_gelu_triton
+from megatron.model.triton_bias_gelu import fused_bias_gelu_triton, _fused_bias_gelu_fwd_kernel, _fused_bias_gelu_bwd_kernel
 from megatron.model.transformer import get_bias_dropout_add, \
             bias_dropout_add_fused_train, bias_dropout_add_fused_inference
 from megatron.model.language_model import Embedding
+
+import fused_weight_gradient_mlp_cuda
 
 
 class GradPatch(torch.autograd.Function):
@@ -144,6 +147,244 @@ class PreAttnModule(MegatronModule):
             return mixed_x_layer, residual
 
 
+class ChunkedMLP(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx, 
+        layernorm_output, dense_h_to_4h_weight, dense_h_to_4h_bias, 
+        dense_4h_to_h_weight, dense_4h_to_h_bias, 
+        chunk_size, sequence_parallel,):
+        
+        # save for linear 1
+        saved_tensors = [layernorm_output, dense_h_to_4h_weight, dense_h_to_4h_bias, dense_4h_to_h_weight]
+        ############### Linear 1 ################
+        # the gathered layernorm_output should be allocated by global buffer which won't cause fragmentation
+        # layernorm_output: s/t, b, h -> s, b, h
+        if sequence_parallel:
+            world_size = mpu.get_tensor_model_parallel_world_size()
+            dim_size = list(layernorm_output.size())
+            dim_size[0] = dim_size[0] * world_size
+            total_input = mpu.get_global_memory_buffer().get_tensor(dim_size, layernorm_output.dtype, "mpu")
+            torch.distributed._all_gather_base(
+                total_input, layernorm_output, group=mpu.get_tensor_model_parallel_group()
+            )
+        else:
+            total_input = layernorm_output
+
+        # s, b, 4h/t
+        # output_ = torch.matmul(total_input, dense_h_to_4h_weight.t())
+
+        ############### GeLU ################
+        # output_ = fused_bias_gelu_triton(output_, dense_h_to_4h_bias)
+
+        ############### Linear 2 ################
+        # s, b, 4h/t -> s, b, h
+        # output_ = torch.matmul(output_, dense_4h_to_h_weight.t())
+
+        intermediate_shape = list(total_input.size())
+        intermediate_shape[-1] = dense_h_to_4h_weight.size(0)
+        intermediate_splits = []
+        linear2_input_splits = []
+
+        # s, b, h
+        if sequence_parallel:
+            output_before_reduce_scatter = mpu.get_global_memory_buffer().get_tensor(list(total_input.size()), layernorm_output.dtype, "full_seq")
+        else:
+            output_before_reduce_scatter = torch.empty_like(total_input)
+        # [s/c, b, h]
+        input_splits = torch.split(total_input, chunk_size, dim=0)
+        output_splits_before_reduce_scatter = torch.split(output_before_reduce_scatter, chunk_size, dim=0)
+        assert len(input_splits) == len(output_splits_before_reduce_scatter), f"len: {len(input_splits)} - {len(output_splits_before_reduce_scatter)}"
+
+        num_splits = len(input_splits)
+        N = dense_h_to_4h_weight.size(0)
+        for i in range(num_splits):
+            # chunked linear 1
+            # s/c, b, 4h/t
+            _split = torch.matmul(input_splits[i], dense_h_to_4h_weight.t())
+            intermediate_splits.append(_split)
+
+            # chunked gelu fusion
+            _output = torch.empty_like(_split)
+            _output_arg = _output.view(-1, N)
+            _input_arg = _split.view(-1, N)
+            M = _input_arg.shape[0]
+            _fused_bias_gelu_fwd_kernel[(M,)](
+                dense_h_to_4h_bias, _input_arg, _output_arg,
+                _input_arg.stride(0), N, BLOCK_SIZE=1024)
+
+            linear2_input_splits.append(_output)
+            # chunked linear 2
+            # s/c, b, h
+            torch.matmul(_output, dense_4h_to_h_weight.t(), out=output_splits_before_reduce_scatter[i])
+
+        # save for gelu fusion
+        saved_tensors.extend(intermediate_splits)
+        
+        # save for linear 2
+        saved_tensors.extend(linear2_input_splits)
+
+        # s, b, h -> s/t, b, h
+        if sequence_parallel:
+            _output = _reduce_scatter_along_first_dim(output_before_reduce_scatter)
+        else:
+            _output = output_before_reduce_scatter
+        
+        output = _output.add_(dense_4h_to_h_bias)
+
+        ctx.save_for_backward(*saved_tensors)
+        ctx.num_splits = num_splits
+        ctx.chunk_size = chunk_size
+        ctx.sequence_parallel = sequence_parallel
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        sequence_parallel = ctx.sequence_parallel
+        layernorm_output, dense_h_to_4h_weight, dense_h_to_4h_bias, dense_4h_to_h_weight, *act_splits = ctx.saved_tensors
+        intermediate_splits = act_splits[:ctx.num_splits]
+        linear2_input_splits = act_splits[ctx.num_splits:]
+
+        ############### Linear 2 ################
+        # s/t, b, h -> s, b, h
+        if sequence_parallel:
+            world_size = mpu.get_tensor_model_parallel_world_size()
+            dim_size = list(grad_output.size())
+            dim_size[0] = dim_size[0] * world_size
+            total_grad_output = mpu.get_global_memory_buffer().get_tensor(dim_size, grad_output.dtype, "mpu")
+            torch.distributed._all_gather_base(
+                total_grad_output, grad_output, group=mpu.get_tensor_model_parallel_group()
+            )
+        else:
+            total_grad_output = grad_output
+        
+        local_bs, hidden_size = total_grad_output.shape[-2:]
+        intermediate_hidden_size = dense_h_to_4h_weight.size(0)
+
+        # s/c, b, h
+        total_grad_output_splits = torch.split(total_grad_output, ctx.chunk_size, dim=0)
+        assert len(total_grad_output_splits) == ctx.num_splits, f"len: {len(total_grad_output_splits)} - {ctx.num_splits}"
+        # grad_dense_4h_to_h_weight = total_grad_output.t().matmul(linear2_input)
+        # gradient_accumulation_fusion by default is True
+        for i in range(1):
+            # s/c * b, 4h/t
+            # linear2_input_split = linear2_input_splits[i].view(-1, intermediate_hidden_size)
+            # s/c * b, h
+            # total_grad_output_split = total_grad_output_splits[i].view(-1, hidden_size)
+
+            linear2_input = torch.cat(linear2_input_splits, dim=0)
+            if dense_4h_to_h_weight.main_grad.dtype == torch.float32:
+                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
+                    linear2_input, total_grad_output, dense_4h_to_h_weight.main_grad
+                )
+            elif dense_4h_to_h_weight.main_grad.dtype in (torch.float16, torch.bfloat16):
+                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
+                    linear2_input, total_grad_output, dense_4h_to_h_weight.main_grad
+                )
+            else:
+                raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
+        grad_dense_4h_to_h_weight = None
+        grad_dense_4h_to_h_bias = total_grad_output.sum(0)
+
+        # s, b, 4h/t
+        # grad_linear2_input = torch.matmul(total_grad_output, dense_4h_to_h_weight)
+
+        ############### GeLU ################
+        grad_intermediate_splits = []
+        N = intermediate_hidden_size
+        # grad_dense_h_to_4h_bias = torch.zeros_like(dense_h_to_4h_bias)
+        for i in range(ctx.num_splits):
+            # chunked linear 2
+            # s/c, b, 4h/t
+            grad_linear2_input_split = torch.matmul(total_grad_output_splits[i], dense_4h_to_h_weight)
+
+            _input = intermediate_splits[i]
+            grad_input = torch.empty_like(_input)
+
+            _input_arg = _input.view(-1, N)
+            M = _input_arg.shape[0]
+            grad_input_arg = grad_input.view(-1, N)
+
+            _fused_bias_gelu_bwd_kernel[(M,)](
+                grad_linear2_input_split, _input_arg, dense_h_to_4h_bias, grad_input_arg,
+                _input_arg.stride(0), N, BLOCK_SIZE=1024)
+
+            grad_intermediate_splits.append(grad_input)
+            # manually accumulate bias gradient
+            # grad_dense_h_to_4h_bias.add_(torch.sum(grad_input_arg, dim=0))
+        
+        ############### Linear 1 ################
+        # s/t, b, h -> s, b, h
+        # should equivalent to total_grad_output
+        if ctx.sequence_parallel:
+            world_size = mpu.get_tensor_model_parallel_world_size()
+            dim_size = list(layernorm_output.size())
+            dim_size[0] = dim_size[0] * world_size
+            total_input = mpu.get_global_memory_buffer().get_tensor(dim_size, layernorm_output.dtype, "mpu")
+            handle = torch.distributed._all_gather_base(
+                total_input, layernorm_output, group=mpu.get_tensor_model_parallel_group(), async_op=True
+            )
+        else:
+            total_input = layernorm_output
+        
+        # s, b, h
+        if ctx.sequence_parallel:
+            grad_input = mpu.get_global_memory_buffer().get_tensor(list(total_input.shape), total_input.dtype, "full_seq")
+        else:
+            grad_input = torch.empty_like(total_input)
+        grad_input_splits = torch.split(grad_input, ctx.chunk_size, dim=0)
+        assert len(grad_input_splits) == len(intermediate_splits), f"len: {len(grad_input_splits)} - {len(intermediate_splits)}"
+
+        for i in range(ctx.num_splits):
+            # s/c, b, h
+            torch.matmul(grad_intermediate_splits[i], dense_h_to_4h_weight, out=grad_input_splits[i])
+        
+        if ctx.sequence_parallel:
+            handle.wait()
+
+        if ctx.sequence_parallel:
+            dim_size = list(layernorm_output.size())
+            sub_grad_input = torch.empty(dim_size, dtype=layernorm_output.dtype, device=layernorm_output.device)
+            handle = torch.distributed._reduce_scatter_base(
+                sub_grad_input, grad_input, group=mpu.get_tensor_model_parallel_group(), async_op=True
+            )
+
+        # s/c, b, h
+        total_input_splits = torch.split(total_input, ctx.chunk_size, dim=0)
+        assert len(total_input_splits) == ctx.num_splits, f"len: {len(total_input_splits)} - {ctx.num_splits}"
+
+        # grad_weight = grad_output.t().matmul(total_input)
+        for i in range(1):
+            # total_input_split = total_input_splits[i].view(-1, hidden_size)
+            # grad_intermediate_split = grad_intermediate_splits[i].view(-1, intermediate_hidden_size)
+            grad_intermediate = torch.cat(grad_intermediate_splits, dim=0)
+            grad_dense_h_to_4h_bias = grad_intermediate.view(-1, intermediate_hidden_size).sum(0)
+            if dense_h_to_4h_weight.main_grad.dtype == torch.float32:
+                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
+                    total_input, grad_intermediate, dense_h_to_4h_weight.main_grad
+                )
+
+            elif dense_h_to_4h_weight.main_grad.dtype in (torch.float16, torch.bfloat16):
+                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
+                    total_input, grad_intermediate, dense_h_to_4h_weight.main_grad
+                )
+            else:
+                raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
+        grad_dense_h_to_4h_weight = None
+        
+        if ctx.sequence_parallel:
+            handle.wait()
+            return (
+                sub_grad_input, grad_dense_h_to_4h_weight, grad_dense_h_to_4h_bias,
+                grad_dense_4h_to_h_weight, grad_dense_4h_to_h_bias, None, None
+            )
+        
+        return (
+            grad_input, grad_dense_h_to_4h_weight, grad_dense_h_to_4h_bias,
+            grad_dense_4h_to_h_weight, grad_dense_4h_to_h_bias, None, None
+        )
+
+
 class PostAttnModule(MegatronModule):
     def __init__(self, config, args, layer_number):
 
@@ -217,6 +458,7 @@ class PostAttnModule(MegatronModule):
         self.retriever = None
 
         self.chunk_size = args.chunk_size
+        self.sequence_parallel = config.sequence_parallel
     
     def _add_mlp_block_attrs(self, args, config):
         self.add_bias = config.add_bias_linear
@@ -229,20 +471,23 @@ class PostAttnModule(MegatronModule):
         self.swiglu = args.swiglu
 
     def forward(self, context_layer, residual):
+        # context_layer: [s*b, a/t, d], residual: [s/t, b, h]
         batch_size = residual.shape[1]
+        # s*b, a/t, d -> s, b, h/t
         context_layer = rearrange(context_layer, '(b s) h d -> s b (h d)', b=batch_size)
 
-        if self.chunk_size > 0:
-            context_layer_splits = torch.split(context_layer, self.chunk_size, dim=0)
-            residual_splits = torch.split(residual, self.chunk_size, dim=0)
-            assert len(context_layer_splits) == len(residual_splits), \
-                f"len: {len(context_layer_splits)} - {len(residual_splits)}, context_layer shape: {context_layer.shape}, residual shape: {residual.shape}"
-            o = []
-            for context_layer_split, residual_split in zip(context_layer_splits, residual_splits):
-                o.append(self.single_forward(context_layer_split, residual_split))
-            o = torch.cat(o, dim=0)
-        else:
-            o = self.single_forward(context_layer, residual)
+        # this is wrong when using sp & tp
+        # if self.chunk_size > 0:
+        #     context_layer_splits = torch.split(context_layer, self.chunk_size, dim=0)
+        #     residual_splits = torch.split(residual, self.chunk_size, dim=0)
+        #     assert len(context_layer_splits) == len(residual_splits), \
+        #         f"len: {len(context_layer_splits)} - {len(residual_splits)}, context_layer shape: {context_layer.shape}, residual shape: {residual.shape}"
+        #     o = []
+        #     for context_layer_split, residual_split in zip(context_layer_splits, residual_splits):
+        #         o.append(self.single_forward(context_layer_split, residual_split))
+        #     o = torch.cat(o, dim=0)
+        # else:
+        o = self.single_forward(context_layer, residual)
         
         output = core.utils.make_viewless_tensor(inp = o,
                                                 requires_grad = o.requires_grad,
@@ -280,27 +525,11 @@ class PostAttnModule(MegatronModule):
         # Layer norm post the self attention.
         layernorm_output = self.post_attention_layernorm(layernorm_input)
 
-        ############### kernel 6 ################
-        # MLP - Linear 1
-        intermediate_parallel, bias_parallel = self.dense_h_to_4h(layernorm_output)
-
-        ############### kernel 7 ################
-        if self.bias_gelu_fusion:
-            assert self.add_bias is True
-            assert self.activation_func == F.gelu
-            if self.use_triton_fusion:
-                activated_parallel = fused_bias_gelu_triton(intermediate_parallel, bias_parallel)
-
-            else:
-                activated_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+        if self.chunk_size > 0:
+            mlp_output, mlp_bias = self.chunked_mlp(layernorm_output, self.chunk_size)
         else:
-            if bias_parallel is not None:
-                intermediate_parallel = intermediate_parallel + bias_parallel
-            activated_parallel = self.activation_func(intermediate_parallel)
-
-        ############### kernel 8 ################
-        # [s, b, h]
-        mlp_output, mlp_bias = self.dense_4h_to_h(activated_parallel)
+            mlp_output, mlp_bias = self.full_mlp(layernorm_output)
+        assert mlp_bias is None
 
         # Second residual connection.
         if self.apply_residual_connection_post_layernorm:
@@ -328,6 +557,38 @@ class PostAttnModule(MegatronModule):
         #                                         keep_graph = True)
 
         return output
+
+    def full_mlp(self, layernorm_output):
+        ############### kernel 6 ################
+        # MLP - Linear 1
+        intermediate_parallel, bias_parallel = self.dense_h_to_4h(layernorm_output)
+
+        ############### kernel 7 ################
+        if self.bias_gelu_fusion:
+            assert self.add_bias is True
+            assert self.activation_func == F.gelu
+            if self.use_triton_fusion:
+                activated_parallel = fused_bias_gelu_triton(intermediate_parallel, bias_parallel)
+
+            else:
+                activated_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+        else:
+            if bias_parallel is not None:
+                intermediate_parallel = intermediate_parallel + bias_parallel
+            activated_parallel = self.activation_func(intermediate_parallel)
+
+        ############### kernel 8 ################
+        # [s, b, h]
+        mlp_output, mlp_bias = self.dense_4h_to_h(activated_parallel)
+
+        return mlp_output, mlp_bias
+
+    def chunked_mlp(self, layernorm_output, chunk_size):
+        assert self.bias_gelu_fusion and self.use_triton_fusion, "only support bias_gelu_fusion with triton fusion"
+        mlp_output = ChunkedMLP.apply(
+            layernorm_output, self.dense_h_to_4h.weight, self.dense_h_to_4h.bias,
+            self.dense_4h_to_h.weight, self.dense_4h_to_h.bias, chunk_size, self.sequence_parallel)
+        return mlp_output, None
 
 
 class PreFlashAttnCheckpointFunction(torch.autograd.Function):

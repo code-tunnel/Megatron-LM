@@ -24,7 +24,7 @@ def get_diff(a, b):
     diff = torch.abs(a- b)
     max_diff = torch.max(diff)
     min_diff = torch.min(diff)
-    return max_diff.item(), min_diff.item()
+    return max_diff.item(), min_diff.item(), diff.norm().item()
 
 
 def sanity_check(args, config, device, rank, world_size, timers):
@@ -159,7 +159,7 @@ def sanity_check(args, config, device, rank, world_size, timers):
 
         # assert torch.allclose(ref_param, cur_param, atol=1e-3, rtol=1e-4), \
         #         f"param name: {cur_name}, shape: {cur_param.shape}, max diff: {torch.max(torch.abs(ref_param-cur_param))}"
-        print(f"param name: {cur_name}, shape: {cur_param.shape}, max diff: {torch.max(torch.abs(ref_param-cur_param))}")
+        print(f"param name: {cur_name}, shape: {cur_param.shape}, diff: {get_diff(ref_param, cur_param)}")
     
     if rank == 0:
         print("(Do I?) pass optimizer")
