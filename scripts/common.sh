@@ -27,7 +27,10 @@ export GPT_ARGS="
     --weight-decay 1e-2 \
     --lr-warmup-fraction .01 \
     --clip-grad 1.0 \
-    --fp16 "
+    --fp16 \
+    --use-flash-attn \
+    --no-attention-mask \
+    --parallel-position-embedding "
 
 VOCAB_FILE="scripts/gpt2tokenizer/gpt2-vocab.json"
 MERGE_FILE="scripts/gpt2tokenizer/gpt2-merges.txt"
@@ -51,3 +54,21 @@ export OUTPUT_ARGS="
     # --tensorboard-log-interval 1\
     # --log-timers-to-tensorboard \
     # --log-memory-to-tensorboard
+
+export LAUNCH_1F1B_CMD="
+    pretrain_gpt.py \
+        $GPT_ARGS \
+        $DATA_ARGS \
+        $OUTPUT_ARGS \
+        --recompute-activations "
+    
+export LAUNCH_HELIX_CMD="
+    pretrain_gpt.py \
+        $GPT_ARGS \
+        $DATA_ARGS \
+        $OUTPUT_ARGS \
+        --attention-pipeline \
+        --num-fold $NUM_FOLD \
+        --num-layers-per-virtual-pipeline-stage 1 \
+        --transfer-weight \
+        --checkpoint-without-attn "
