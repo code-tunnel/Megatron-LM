@@ -1,0 +1,3 @@
+[submodule "zero_bubble_pipeline"]
+	path = zero_bubble_pipeline
+	url = https://github.com/sail-sg/zero-bubble-pipeline-parallelism.git
