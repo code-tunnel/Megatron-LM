@@ -52,6 +52,72 @@ except ImportError:
         hyperparameters: transformer hyperparameters
 """
 
+import time
+LAYER_FWD_START, ATTN_FWD_START, ATTN_FWD_END, LAYER_FWD_END = None, None, None, None
+LAYER_BWD_START, ATTN_BWD_START, ATTN_BWD_END, LAYER_BWD_END = None, None, None, None
+
+
+# Forward timing getters
+def get_layer_fwd_start():
+    return LAYER_FWD_START
+
+def get_attn_fwd_start():
+    return ATTN_FWD_START
+
+def get_attn_fwd_end():
+    return ATTN_FWD_END
+
+def get_layer_fwd_end():
+    return LAYER_FWD_END
+
+# Forward timing setters
+def set_layer_fwd_start(time):
+    global LAYER_FWD_START
+    LAYER_FWD_START = time
+
+def set_attn_fwd_start(time):
+    global ATTN_FWD_START
+    ATTN_FWD_START = time
+
+def set_attn_fwd_end(time):
+    global ATTN_FWD_END
+    ATTN_FWD_END = time
+
+def set_layer_fwd_end(time):
+    global LAYER_FWD_END
+    LAYER_FWD_END = time
+
+# Backward timing getters
+def get_layer_bwd_start():
+    return LAYER_BWD_START
+
+def get_attn_bwd_start():
+    return ATTN_BWD_START
+
+def get_attn_bwd_end():
+    return ATTN_BWD_END
+
+def get_layer_bwd_end():
+    return LAYER_BWD_END
+
+# Backward timing setters
+def set_layer_bwd_start(time):
+    global LAYER_BWD_START
+    LAYER_BWD_START = time
+
+def set_attn_bwd_start(time):
+    global ATTN_BWD_START
+    ATTN_BWD_START = time
+
+def set_attn_bwd_end(time):
+    global ATTN_BWD_END
+    ATTN_BWD_END = time
+
+def set_layer_bwd_end(time):
+    global LAYER_BWD_END
+    LAYER_BWD_END = time
+
+
 class DropPath(MegatronModule):
     """Drop paths (Stochastic Depth) per sample
     (when applied in main path of residual blocks).
@@ -700,6 +766,14 @@ class ParallelAttention(MegatronModule):
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
+        args = get_args()
+        if args.layer_benchmark:
+            torch.cuda.synchronize()
+            set_attn_fwd_start(time.time())
+            def attn_bwd_end_hook(grad):
+                torch.cuda.synchronize()
+                set_attn_bwd_end(time.time())
+            query_layer.register_hook(attn_bwd_end_hook)
 
         if not self.use_flash_attn:
             if self.checkpoint_core_attention:
@@ -717,6 +791,14 @@ class ParallelAttention(MegatronModule):
             else:
                 context_layer = self.core_attention_flash(q, k, v)
             context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
+
+        if args.layer_benchmark:
+            torch.cuda.synchronize()
+            set_attn_fwd_end(time.time())
+            def attn_bwd_start_hook(grad):
+                torch.cuda.synchronize()
+                set_attn_bwd_start(time.time())
+            context_layer.register_hook(attn_bwd_start_hook)
 
         # =================
         # Output. [sq, b, h]
@@ -1074,6 +1156,15 @@ class ParallelTransformerLayer(MegatronModule):
                 rotary_pos_emb=None):
         # hidden_states: [s, b, h]
 
+        args = get_args()
+        if args.layer_benchmark:
+            torch.cuda.synchronize()
+            set_layer_fwd_start(time.time())
+            def layer_bwd_end_hook(grad):
+                torch.cuda.synchronize()
+                set_layer_bwd_end(time.time())
+            hidden_states.register_hook(layer_bwd_end_hook)
+
         # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
 
@@ -1190,6 +1281,14 @@ class ParallelTransformerLayer(MegatronModule):
                                               p=self.hidden_dropout,
                                               training=self.training)
             output = residual + self.drop_path(out)
+
+        if args.layer_benchmark:
+            torch.cuda.synchronize()
+            set_layer_fwd_end(time.time())
+            def layer_bwd_start_hook(grad):
+                torch.cuda.synchronize()
+                set_layer_bwd_start(time.time())
+            output.register_hook(layer_bwd_start_hook)
 
         if self.layer_type == LayerType.retro_decoder_with_retriever:
             return output, retriever_output

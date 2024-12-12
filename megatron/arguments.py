@@ -84,6 +84,7 @@ def _add_experimental_args(parser: argparse.ArgumentParser):
     group.add_argument('--profile-prefix', type=str, default='tb_log')
     group.add_argument('--dump-memory-snapshot', action='store_true')
     group.add_argument('--memory-snapshot-prefix', type=str, default='mem_snapshot')
+    group.add_argument('--layer-benchmark', action='store_true')
     
     return parser
 
